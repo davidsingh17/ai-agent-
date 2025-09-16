@@ -1,2 +1,10 @@
 
 snapshots/
+
+# ignore snapshots
+snapshots/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+

@@ -1,0 +1,84 @@
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: ai_agent
+      POSTGRES_USER: ai_agent
+      POSTGRES_PASSWORD: ai_agent_pw
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./infra/db/init.sql:/docker-entrypoint-initdb.d/000-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # API
+      - "9001:9001"   # Console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9000/minio/health/ready || curl -sS http://127.0.0.1:9000/minio/health/ready"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  createbucket:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local ${S3_ENDPOINT:-http://minio:9000} ${S3_ACCESS_KEY:-minioadmin} ${S3_SECRET_KEY:-minioadmin} &&
+      mc mb -p local/${S3_BUCKET:-ai-agent-dev} || true &&
+      exit 0
+      "
+
+  backend:
+    build:
+      context: ./apps/backend
+      dockerfile: Dockerfile
+    volumes:
+      - ./apps/backend/app:/app/app:ro
+      - ./apps/backend/requirements.txt:/app/requirements.txt:ro
+    env_file:
+      - ./.env
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      createbucket:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    working_dir: /app
+    command: python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # No-code dashboard
+  appsmith:
+    image: appsmith/appsmith-ce
+    ports:
+      - "8080:80"
+    volumes:
+      - appsmith_stacks:/appsmith-stacks
+    depends_on:
+      backend:
+        condition: service_started
+
+volumes:
+  db_data:
+  minio_data:
+  appsmith_stacks:

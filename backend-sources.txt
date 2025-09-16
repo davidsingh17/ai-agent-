@@ -1,0 +1,1440 @@
+===== FILE: apps/backend/app/core/config.py =====
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    env: str = "dev"
+    cors_origins: str = "*"
+
+    # DB
+    postgres_db: str = "ai_agent"
+    postgres_user: str = "ai_agent"
+    postgres_password: str = "ai_agent_pw"
+    postgres_port: int = 5432
+    postgres_host: str = "db"
+
+    # S3
+    s3_endpoint: str = "http://minio:9000"
+    s3_region: str = "eu-south-1"
+    s3_bucket: str = "ai-agent-dev"
+    s3_access_key: str = "minioadmin"
+    s3_secret_key: str = "minioadmin"
+
+    # Redis
+    redis_url: str = "redis://redis:6379/0"
+
+    class Config:
+        env_file = ".env"
+        extra = "ignore"
+
+settings = Settings()
+===== FILE: apps/backend/app/core/__init__.py =====
+===== FILE: apps/backend/app/__init__.py =====
+===== FILE: apps/backend/app/utils/__init__.py =====
+===== FILE: apps/backend/app/utils/logger.py =====
+from loguru import logger
+logger.add("logs/app.log", rotation="10 MB", retention="7 days", backtrace=True, diagnose=True, level="INFO")
+===== FILE: apps/backend/app/schemas/__init__.py =====
+===== FILE: apps/backend/app/schemas/invoice.py =====
+from typing import Optional, List
+from pydantic import BaseModel, Field
+
+
+class S3Ref(BaseModel):
+    bucket: str
+    key: str
+
+
+class InvoiceLine(BaseModel):
+    descrizione: Optional[str] = None
+    qta: Optional[float] = None
+    prezzo_unitario: Optional[float] = None
+    aliquota_iva: Optional[float] = None
+    totale_riga: Optional[float] = None
+
+
+class InvoiceFields(BaseModel):
+    intestatario: Optional[str] = None
+    partita_iva: Optional[str] = None
+    codice_fiscale: Optional[str] = None
+    invoice_number: Optional[str] = None
+
+    # Le date possono mancare o non essere parse → opzionali
+    data_emissione: Optional[str] = None  # oppure date: Optional[date] se preferisci
+    data_scadenza: Optional[str] = None
+
+    valuta: Optional[str] = "EUR"
+
+    # 🔑 Qui la fix: importi opzionali (XML può non fornirli)
+    imponibile: Optional[float] = None
+    iva: Optional[float] = None
+    totale: Optional[float] = None
+
+
+class InvoiceOut(BaseModel):
+    id: str
+    s3: S3Ref
+    filename: Optional[str] = None
+    fields: InvoiceFields
+    righe: List[InvoiceLine] = Field(default_factory=list)
+
+
+# ---- Liste / paginazione ----
+
+class InvoiceListItem(BaseModel):
+    id: str
+    filename: Optional[str] = None
+    intestatario: Optional[str] = None
+    invoice_number: Optional[str] = None
+    data_emissione: Optional[str] = None
+    totale: Optional[float] = None
+
+
+class InvoiceListResponse(BaseModel):
+    items: List[InvoiceListItem]
+    total: int
+    limit: int
+    offset: int
+
+
+class PresignedUrlOut(BaseModel):
+    url: str
+    expires_in: int
+===== FILE: apps/backend/app/api/v1/routers/health.py =====
+from fastapi import APIRouter
+import os
+from typing import Dict, Any
+
+# DB
+from app.services.db import execute
+
+# S3/MinIO
+import boto3
+from botocore.client import Config
+
+# Redis
+import redis
+
+router = APIRouter(prefix="/health", tags=["health"])
+
+
+def _s3_client():
+    endpoint = (
+        os.getenv("S3_ENDPOINT")
+        or os.getenv("MINIO_ENDPOINT")
+        or "http://minio:9000"
+    )
+    access_key = os.getenv("S3_ACCESS_KEY") or os.getenv("MINIO_ACCESS_KEY") or "minioadmin"
+    secret_key = os.getenv("S3_SECRET_KEY") or os.getenv("MINIO_SECRET_KEY") or "minioadmin"
+    region = os.getenv("S3_REGION") or "us-east-1"
+
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region,
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+
+
+def _ok(data: Dict[str, Any] = None):
+    return {"status": "up", **(data or {})}
+
+
+def _down(error: str):
+    return {"status": "down", "error": error}
+
+
+@router.get("")
+def health_root():
+    """Panoramica veloce: DB, S3 e Redis."""
+    out = {}
+
+    # DB
+    try:
+        execute("SELECT 1;")
+        out["db"] = _ok()
+    except Exception as e:
+        out["db"] = _down(str(e))
+
+    # S3/MinIO
+    try:
+        s3 = _s3_client()
+        # list_buckets come "ping"
+        s3.list_buckets()
+        out["s3"] = _ok({"endpoint": os.getenv("S3_ENDPOINT") or os.getenv("MINIO_ENDPOINT")})
+    except Exception as e:
+        out["s3"] = _down(str(e))
+
+    # Redis
+    try:
+        r = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"))
+        r.ping()
+        out["redis"] = _ok()
+    except Exception as e:
+        out["redis"] = _down(str(e))
+
+    # overall
+    overall = "up" if all(v.get("status") == "up" for v in out.values()) else "down"
+    return {"status": overall, **out}
+
+
+@router.get("/db")
+def health_db():
+    try:
+        execute("SELECT 1;")
+        return _ok()
+    except Exception as e:
+        return _down(str(e))
+
+
+@router.get("/s3")
+def health_s3():
+    try:
+        s3 = _s3_client()
+        s3.list_buckets()
+        return _ok({"endpoint": os.getenv("S3_ENDPOINT") or os.getenv("MINIO_ENDPOINT")})
+    except Exception as e:
+        return _down(str(e))
+
+
+@router.get("/redis")
+def health_redis():
+    try:
+        r = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"))
+        r.ping()
+        return _ok()
+    except Exception as e:
+        return _down(str(e))
+===== FILE: apps/backend/app/api/v1/routers/__init__.py =====
+===== FILE: apps/backend/app/api/v1/routers/debug.py =====
+from fastapi import APIRouter, UploadFile, File
+from pdfminer.high_level import extract_text
+from io import BytesIO
+from pdf2image import convert_from_bytes
+import pytesseract
+
+router = APIRouter()
+
+@router.post("/debug/extract-text")
+async def debug_extract_text(file: UploadFile = File(...)):
+    data = await file.read()
+    # PDFMiner
+    try:
+        pdfminer_text = extract_text(BytesIO(data)) or ""
+    except Exception:
+        pdfminer_text = ""
+    # OCR (prima pagina)
+    try:
+        images = convert_from_bytes(data, dpi=300, first_page=1, last_page=1, fmt="png", thread_count=1)
+        ocr_text = pytesseract.image_to_string(images[0], lang="ita+eng") if images else ""
+    except Exception:
+        ocr_text = ""
+
+    return {
+        "len_pdfminer": len(pdfminer_text),
+        "len_ocr": len(ocr_text),
+        "sample_pdfminer": pdfminer_text[:600],
+        "sample_ocr": ocr_text[:600]
+    }
+===== FILE: apps/backend/app/api/v1/routers/invoices.py =====
+from fastapi import APIRouter, UploadFile, File, HTTPException, Query
+import uuid
+import os
+from typing import List, Optional
+from uuid import UUID  # 👈 NEW
+
+from app.services.storage import upload_bytes
+from app.services.repository_invoices import insert_invoice_header, insert_invoice_lines
+from app.services.parsers.invoice_xml import parse_xml_fatturapa
+from app.services.parsers.invoice_pdf import parse_pdf_invoice
+
+from app.schemas.invoice import (
+    InvoiceOut, InvoiceListItem, InvoiceListResponse, PresignedUrlOut
+)
+from app.services.invoice_service import (
+    list_invoices, get_invoice, get_presigned_url
+)
+
+# Questo router ha prefix '/invoices'. Nel main viene montato con prefix '/api/v1',
+# quindi gli endpoint finali saranno '/api/v1/invoices/...'
+router = APIRouter(prefix="/invoices", tags=["invoices"])
+
+IS_TESTING = os.getenv("TESTING") == "1"
+
+
+def _merge_defaults(parsed: dict) -> dict:
+    fields = parsed.get("fields", {}) or {}
+    fields.setdefault("valuta", "EUR")
+    parsed["fields"] = fields
+    parsed.setdefault("righe", [])
+    return parsed
+
+
+def _to_float_safe(x) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).replace(".", "").replace(",", ".").replace("%", "").strip()
+        return float(s)
+    except Exception:
+        return None
+
+
+def _backfill_amounts(fields: dict) -> dict:
+    """
+    Se tra imponibile/iva/totale ne manca uno, ricostruiscilo dagli altri due.
+    Mantiene coerenza con arrotondamento a 2 decimali.
+    """
+    imp = _to_float_safe(fields.get("imponibile"))
+    iva = _to_float_safe(fields.get("iva"))
+    tot = _to_float_safe(fields.get("totale"))
+
+    # Calcola il mancante se due sono presenti
+    if imp is None and iva is not None and tot is not None:
+        base = round(tot - iva, 2)
+        if base >= 0:
+            imp = base
+    elif iva is None and imp is not None and tot is not None:
+        tax = round(tot - imp, 2)
+        if tax >= 0:
+            iva = tax
+    elif tot is None and imp is not None and iva is not None:
+        tot = round(imp + iva, 2)
+
+    # Riallinea lievi discrepanze
+    if imp is not None and iva is not None:
+        calc = round(imp + iva, 2)
+        if tot is None or abs(calc - tot) <= 0.05:
+            tot = calc
+
+    # Scrivi indietro nei campi
+    fields["imponibile"] = imp
+    fields["iva"] = iva
+    fields["totale"] = tot
+    return fields
+
+
+@router.post("/extract", response_model=InvoiceOut)
+async def extract_invoice(file: UploadFile = File(...)):
+    """
+    Carica il file su S3/MinIO, esegue il parsing (XML/PDF),
+    salva header+righe su DB e ritorna l'oggetto InvoiceOut.
+    In test (TESTING=1) bypassa S3/DB se non disponibili.
+    """
+    try:
+        file_bytes = await file.read()
+
+        # 1) Parser (sceglie XML o PDF)
+        name_lower = (file.filename or "").lower()
+        content_type = (file.content_type or "").lower()
+        if name_lower.endswith(".xml") or "xml" in content_type:
+            parsed = parse_xml_fatturapa(file_bytes)
+        elif name_lower.endswith(".pdf") or "pdf" in content_type:
+            parsed = parse_pdf_invoice(file_bytes)
+        else:
+            parsed = {"fields": {"valuta": "EUR"}, "righe": []}
+
+        parsed = _merge_defaults(parsed)
+
+        # 1b) Backfill importi se qualche campo manca (es. XML senza imponibile)
+        parsed["fields"] = _backfill_amounts(parsed["fields"])
+        f = parsed["fields"]
+
+        # 2) Upload su S3/MinIO (o finto in test)
+        fake_s3 = {"bucket": "test-bucket", "key": f"invoices/{uuid.uuid4()}_{file.filename or 'file'}"}
+        upload_result = None
+        try:
+            file_id = str(uuid.uuid4())
+            s3_key = f"invoices/{file_id}_{file.filename}"
+            upload_result = upload_bytes(s3_key, file_bytes, content_type=(file.content_type or "application/octet-stream"))
+        except Exception:
+            if not IS_TESTING:
+                raise
+            upload_result = fake_s3  # fallback in test
+
+        # 3) Persistenza su DB (o bypass in test)
+        invoice_uuid = str(uuid.uuid4())
+        try:
+            insert_invoice_header(
+                id=invoice_uuid,
+                s3_bucket=upload_result["bucket"],
+                s3_key=upload_result["key"],
+                filename=file.filename,
+                invoice_number=f.get("invoice_number"),
+                intestatario=f.get("intestatario"),
+                partita_iva=f.get("partita_iva"),
+                codice_fiscale=f.get("codice_fiscale"),
+                issue_date=f.get("data_emissione"),
+                due_date=f.get("data_scadenza"),
+                currency=f.get("valuta", "EUR"),
+                imponibile=f.get("imponibile"),
+                iva=f.get("iva"),
+                totale=f.get("totale"),
+            )
+            insert_invoice_lines(invoice_id=invoice_uuid, lines=parsed.get("righe", []))
+        except Exception:
+            if not IS_TESTING:
+                raise
+            # in test, se DB non disponibile, proseguiamo comunque
+
+        # 4) Response
+        return InvoiceOut(
+            id=invoice_uuid,
+            s3=upload_result,
+            filename=file.filename,
+            fields=f,
+            righe=parsed.get("righe", []),
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("", response_model=InvoiceListResponse)  # << niente slash per evitare 307
+def list_invoices_route(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    items_raw, total = list_invoices(limit=limit, offset=offset)
+    items: List[InvoiceListItem] = []
+    for inv in items_raw:
+        fields = inv.get("fields", {}) or {}
+        items.append(InvoiceListItem(
+            id=inv["id"],
+            filename=inv.get("filename", "document.pdf"),
+            intestatario=fields.get("intestatario"),
+            invoice_number=fields.get("invoice_number"),
+            data_emissione=fields.get("data_emissione"),
+            totale=fields.get("totale"),
+        ))
+    return InvoiceListResponse(items=items, total=total, limit=limit, offset=offset)
+
+
+@router.get("/{invoice_id}", response_model=InvoiceOut)
+def get_invoice_route(invoice_id: UUID):  # 👈 tipizzato UUID
+    inv = get_invoice(str(invoice_id))     # 👈 convertito in stringa per il servizio/DB
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    return InvoiceOut(
+        id=inv["id"],
+        s3=inv["s3"],
+        filename=inv.get("filename", "document.pdf"),
+        fields=inv.get("fields", {}) or {},
+        righe=inv.get("righe", []) or [],
+    )
+
+
+@router.get("/{invoice_id}/download", response_model=PresignedUrlOut)
+def download_invoice_route(
+    invoice_id: UUID,  # 👈 tipizzato UUID
+    expires_in: int = Query(900, ge=60, le=86400)
+):
+    inv = get_invoice(str(invoice_id))     # 👈 convertito in stringa per il servizio/DB
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    url = get_presigned_url(bucket=inv["s3"]["bucket"], key=inv["s3"]["key"], expires_in=expires_in)
+    if not url:
+        raise HTTPException(status_code=500, detail="Unable to generate presigned URL")
+    return PresignedUrlOut(url=url, expires_in=expires_in)
+===== FILE: apps/backend/app/api/v1/__init__.py =====
+===== FILE: apps/backend/app/api/__init__.py =====
+===== FILE: apps/backend/app/main.py =====
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.core.config import settings
+from app.api.v1.routers.health import router as health_router
+from app.api.v1.routers.debug import router as debug_router
+from app.api.v1.routers.invoices import router as invoices_router  # ✅ router corretto
+
+app = FastAPI(title="AI Agent API", version="0.1.0")
+
+# Configura CORS (robusto e con default per Vite)
+raw_origins = getattr(settings, "cors_origins", "") or ""
+parsed_origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
+
+# Default sicuro per sviluppo (Vite su :8081)
+if not parsed_origins:
+    parsed_origins = ["http://localhost:8081"]
+
+# Nota: se usi "*", i browser non permettono credenziali con wildcard
+allow_credentials = True
+if "*" in parsed_origins:
+    allow_credentials = False
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=parsed_origins,
+    allow_credentials=allow_credentials,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Monta i router
+app.include_router(health_router, prefix="/api/v1")
+app.include_router(invoices_router, prefix="/api/v1")  # => /api/v1/invoices/...
+app.include_router(debug_router, prefix="/api/v1")
+
+
+@app.get("/")
+def root():
+    return {"name": "AI Agent API", "status": "ok"}
+===== FILE: apps/backend/app/routes/__init__.py =====
+===== FILE: apps/backend/app/services/db.py =====
+import psycopg2
+import psycopg2.extras
+from ..core.config import settings
+
+def get_conn():
+    return psycopg2.connect(
+        dbname=settings.postgres_db,
+        user=settings.postgres_user,
+        password=settings.postgres_password,
+        host=settings.postgres_host,
+        port=settings.postgres_port,
+    )
+
+def execute(query: str, params: tuple = ()):
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(query, params)
+            try:
+                return cur.fetchall()
+            except psycopg2.ProgrammingError:
+                return None
+===== FILE: apps/backend/app/services/parsers/invoice_pdf.py =====
+import re
+from io import BytesIO
+from typing import Dict, Any, List, Optional
+
+from pdfminer.high_level import extract_text
+from pdf2image import convert_from_bytes
+import pytesseract
+from PIL import Image, ImageOps, ImageFilter
+
+from .common import (
+    first_match, _to_float, _to_date, lines as split_lines, prev_nonempty,
+    IVA_RAW, IVA_LABELED, CF_SPACED, CURRENCY_REGEX,
+    TOTAL_LABELED, NET_LABELED, VAT_LABELED,
+    DATE_EMISSIONE, DATE_SCADENZA, DATE_ANY, INVOICE_NO_REGEX,
+    is_noise_name, normalize_cf
+)
+
+# -------- Regex importi/numero documento --------
+AMOUNT = r"(\d{1,3}(?:[.,\s\u202F\u00A0]\d{3})*(?:[.,]\d{2}))"
+RE_AMOUNT = re.compile(AMOUNT)
+
+RE_FATTURA_ONELINE = re.compile(r"\bfattura\b[^\S\r\n]*([A-Za-z0-9/\-]{1,15})", re.IGNORECASE)
+RE_IMP_ONELINE     = re.compile(r"(?:imponibile(?:\s+prestazione)?)\s*[:€]?\s*" + AMOUNT, re.IGNORECASE)
+RE_IVA_ONELINE     = re.compile(r"\biva\b[^\n\r%]*%?[^\d]{0,10}" + AMOUNT, re.IGNORECASE)
+# escludi "totale imponibile"
+RE_TOT_ONELINE     = re.compile(r"\btotale\b(?!\s*imponibile)[^\d€]*€?\s*" + AMOUNT, re.IGNORECASE)
+
+# percentuale IVA (es. "IVA 22%", "IVA: 10 %")
+RE_VAT_PERCENT = re.compile(r"\biva\b[^\n\r]{0,20}?(\d{1,2})(?:[.,]\d+)?\s*%", re.IGNORECASE)
+
+DATE_LIKE    = re.compile(r"^\d{2}[./]\d{2}[./](\d{2}|\d{4})$")
+DATE_LIKE_ANYWHERE = re.compile(r"\b\d{2}[./]\d{2}[./](\d{2}|\d{4})\b")
+CAND_INVOICE = re.compile(r"^(?:\d{1,6}|\d{1,4}/\d{2,4})$")
+LABELY       = {"data", "cliente", "indirizzo", "citta'", "città"}
+
+def _clean_amount(s: str) -> str:
+    return s.replace("\u202f", "").replace("\xa0", "").replace(" ", "")
+
+def _is_amount_inside_date(line: str, start: int, end: int) -> bool:
+    for dm in DATE_LIKE_ANYWHERE.finditer(line):
+        ds, de = dm.span()
+        if start >= ds and end <= de:
+            return True
+    return False
+
+def _amount_in_line(s: str) -> Optional[float]:
+    for m in RE_AMOUNT.finditer(s):
+        if _is_amount_inside_date(s, m.start(1), m.end(1)):
+            continue
+        return _to_float(_clean_amount(m.group(1)))
+    return None
+
+def _iva_from_oneline_safe(one_line: str) -> Optional[float]:
+    m = RE_IVA_ONELINE.search(one_line)
+    if not m:
+        return None
+    if _is_amount_inside_date(one_line, m.start(1), m.end(1)):
+        return None
+    start_iva = one_line.lower().find("iva")
+    num_start = m.start(1)
+    between = one_line[start_iva:num_start].lower()
+    if "totale" in between or "imponibile" in between or "totale documento" in between:
+        return None
+    return _to_float(_clean_amount(m.group(1)))
+
+def _vat_percent(text: str) -> Optional[float]:
+    # cerca un'aliquota plausibile 4–30%
+    m = RE_VAT_PERCENT.search(text)
+    if not m:
+        return None
+    try:
+        p = float(m.group(1).replace(",", "."))
+        if 4 <= p <= 30:
+            return p
+    except ValueError:
+        pass
+    return None
+
+def _looks_like_name(s: str) -> bool:
+    s = s.strip()
+    if is_noise_name(s):
+        return False
+    words = [w for w in s.split() if w.isalpha()]
+    return 2 <= len(words) <= 4 and sum(ch.isdigit() for ch in s) == 0
+
+def _guess_intestatario(ll: List[str], idx_piva: Optional[int]) -> Optional[str]:
+    if idx_piva is not None:
+        for look in range(1, 6):
+            j = idx_piva - look
+            if j < 0:
+                break
+            cand = ll[j].strip()
+            if _looks_like_name(cand):
+                return cand
+    idx_cliente = next((i for i, l in enumerate(ll) if "cliente" in l.lower()), None)
+    for i, cand in enumerate(ll):
+        if idx_cliente is not None and abs(i - idx_cliente) <= 2:
+            continue
+        if _looks_like_name(cand):
+            return cand
+    return None
+
+def _invoice_number_from_lines(ll: List[str]) -> Optional[str]:
+    for i, l in enumerate(ll):
+        if "fattura" in l.lower():
+            m = RE_FATTURA_ONELINE.search(l)
+            if m:
+                cand = m.group(1).strip()
+                if cand and not DATE_LIKE.match(cand) and "." not in cand and CAND_INVOICE.match(cand):
+                    return cand
+            steps = 0
+            j = i + 1
+            while j < len(ll) and steps < 4:
+                nxt = ll[j].strip()
+                if nxt:
+                    low = nxt.lower()
+                    if not DATE_LIKE.match(nxt) and "." not in nxt and not any(lbl in low for lbl in LABELY):
+                        if CAND_INVOICE.match(nxt):
+                            return nxt
+                    steps += 1
+                j += 1
+    return None
+
+# -------- Block parser per importi etichettati --------
+def _find_amount_block(ll: List[str], label: str, window: int = 6, iva_mode: bool = False) -> Optional[float]:
+    for i, line in enumerate(ll):
+        low = line.lower()
+        if label.lower() in low:
+            if label.lower() == "totale" and "imponibile" in low:
+                continue
+            val_same = _amount_in_line(line)
+            if val_same is not None:
+                return val_same
+            steps = 0
+            j = i + 1
+            while j < len(ll) and steps < window:
+                nxt = ll[j].strip()
+                if nxt:
+                    v = _amount_in_line(nxt)
+                    if v is not None:
+                        return v
+                    steps += 1
+                j += 1
+    return None
+
+# -------- Euristiche sugli importi --------
+def _amounts_with_indexes(ll: List[str]) -> List[tuple[int, float]]:
+    res: List[tuple[int, float]] = []
+    for idx, line in enumerate(ll):
+        for m in RE_AMOUNT.finditer(line):
+            if _is_amount_inside_date(line, m.start(1), m.end(1)):
+                continue
+            v = _to_float(_clean_amount(m.group(1)))
+            if v is not None:
+                res.append((idx, v))
+    return res
+
+def _assign_from_bottom(ll: List[str]) -> Dict[str, Optional[float]]:
+    tail = ll[-15:] if len(ll) > 15 else ll[:]
+    base = len(ll) - len(tail)
+    pairs = []
+    for i, line in enumerate(tail):
+        for m in RE_AMOUNT.finditer(line):
+            if _is_amount_inside_date(line, m.start(1), m.end(1)):
+                continue
+            v = _to_float(_clean_amount(m.group(1)))
+            if v is not None:
+                pairs.append((base + i, v))
+
+    best = {"iva": None, "imponibile": None, "totale": None}
+    best_err = 1e9
+    n = len(pairs)
+    for i in range(n):
+        for j in range(i+1, n):
+            for k in range(j+1, n):
+                a = pairs[i][1]; b = pairs[j][1]; c = pairs[k][1]
+                for iva, imp, tot in ((a,b,c),(a,c,b),(b,a,c),(b,c,a),(c,a,b),(c,b,a)):
+                    if tot < imp or tot < iva:
+                        continue
+                    if tot > 50 and iva < 1:
+                        continue
+                    err = abs((imp + iva) - tot)
+                    if err <= 0.05 and tot >= imp > 0 and iva > 0:
+                        if err < best_err or (abs(err-best_err) <= 0.001 and tot > (best["totale"] or 0)):
+                            best = {"iva": round(iva,2), "imponibile": round(imp,2), "totale": round(tot,2)}
+                            best_err = err
+    return best
+
+def _assign_amounts_by_heuristic(text: str, ll: List[str]) -> Dict[str, Optional[float]]:
+    best = _assign_from_bottom(ll)
+    if best["totale"] is not None:
+        return best
+
+    vals = sorted(set(round(v,2) for _, v in _amounts_with_indexes(ll)))
+    m = len(vals)
+    best = {"iva": None, "imponibile": None, "totale": None}
+    best_err = 1e9
+    for i in range(m):
+        for j in range(i+1, m):
+            for k in range(j+1, m):
+                iva, imp, tot = vals[i], vals[j], vals[k]
+                if tot < imp or tot < iva:
+                    continue
+                if tot > 50 and iva < 1:
+                    continue
+                err = abs((imp + iva) - tot)
+                if err <= 0.05 and tot >= imp > 0 and iva > 0:
+                    if err < best_err or (abs(err-best_err) <= 0.001 and tot > (best["totale"] or 0)):
+                        best = {"iva": iva, "imponibile": imp, "totale": tot}
+                        best_err = err
+    return best
+
+# -------- Estrazione testo --------
+def _extract_text_pdfminer(file_bytes: bytes) -> str:
+    try:
+        return extract_text(BytesIO(file_bytes)) or ""
+    except Exception:
+        return ""
+
+def _preprocess(img: Image.Image) -> Image.Image:
+    try:
+        g = img.convert("L")
+        g = ImageOps.autocontrast(g)
+        w, h = g.size
+        g = g.resize((int(w*1.5), int(h*1.5)))
+        g = g.filter(ImageFilter.SHARPEN)
+        g = g.point(lambda p: 255 if p > 180 else 0)
+        return g
+    except Exception:
+        return img
+
+def _ocr_one(img: Image.Image) -> str:
+    try:
+        return pytesseract.image_to_string(img, lang="ita+eng")
+    except Exception:
+        try:
+            return pytesseract.image_to_string(img, lang="eng")
+        except Exception:
+            return ""
+
+def _extract_text_ocr(file_bytes: bytes) -> str:
+    try:
+        images = convert_from_bytes(file_bytes, dpi=300, first_page=1, last_page=1, fmt="png", thread_count=1)
+        if not images:
+            return ""
+        base = images[0]
+        variants = [_preprocess(base), _preprocess(base.rotate(90, expand=True)), _preprocess(base.rotate(270, expand=True))]
+        candidates: List[str] = [_ocr_one(v) for v in variants]
+        return max(candidates, key=lambda t: len(t.strip())) if candidates else ""
+    except Exception:
+        return ""
+
+def _extract_text_auto(file_bytes: bytes) -> str:
+    txt = _extract_text_pdfminer(file_bytes)
+    if len(txt.strip()) >= 200:
+        return txt
+    ocr_txt = _extract_text_ocr(file_bytes)
+    return ocr_txt if len(ocr_txt.strip()) > len(txt.strip()) else txt
+
+# -------- Parsing principale --------
+def _parse_from_text(text: str) -> Dict[str, Any]:
+    ll = split_lines(text)
+    one_line = re.sub(r"[\r\n]+", " ", text)
+
+    # P.IVA / CF
+    piva = first_match(IVA_LABELED, text) or first_match(IVA_RAW, text)
+    cf_raw = first_match(CF_SPACED, text)
+    cf = normalize_cf(cf_raw)
+
+    # Valuta
+    currency = "EUR" if ("€" in text or first_match(CURRENCY_REGEX, text)) else "EUR"
+
+    # --- Importi (1): regex globali / one-line
+    totale = _to_float(first_match(TOTAL_LABELED, text))
+    imponibile = _to_float(first_match(NET_LABELED, text))
+    iva = _to_float(first_match(VAT_LABELED, text))
+
+    if imponibile is None:
+        m = RE_IMP_ONELINE.search(one_line);  imponibile = _to_float(_clean_amount(m.group(1))) if m else None
+    if iva is None:
+        iva = _iva_from_oneline_safe(one_line)
+    if totale is None:
+        m = RE_TOT_ONELINE.search(one_line);  totale = _to_float(_clean_amount(m.group(1))) if m else None
+
+    # --- Importi (2): block parser robusto
+    imp2 = _find_amount_block(ll, "imponibile", window=8)
+    iva2 = _find_amount_block(ll, "iva", window=8, iva_mode=True)
+    tot2 = _find_amount_block(ll, "totale", window=8)
+
+    if imponibile is None:
+        imponibile = imp2
+    if iva is None or (iva is not None and imponibile is not None and abs(iva - imponibile) < 1e-6):
+        iva = iva2 if iva2 is not None else iva
+    if totale is None or (totale is not None and imponibile is not None and abs(totale - imponibile) < 1e-6):
+        totale = tot2 if tot2 is not None else totale
+
+    # --- Importi (2b): usa percentuale se presente
+    vat_perc = _vat_percent(text)
+    if vat_perc and imponibile is not None:
+        if iva is None or abs(iva - imponibile) <= 0.01:
+            iva = round(imponibile * vat_perc / 100.0, 2)
+
+    # --- Importi (3): fallback euristico (dalle ultime righe)
+    incoerente = (imponibile is not None and iva is not None and totale is not None and abs((imponibile + iva) - totale) > 0.05)
+    if (imponibile is None or iva is None or totale is None) or incoerente:
+        guess = _assign_amounts_by_heuristic(text, ll)
+        if iva is None and guess["iva"] is not None:
+            iva = guess["iva"]
+        if imponibile is None and guess["imponibile"] is not None:
+            imponibile = guess["imponibile"]
+        if totale is None and guess["totale"] is not None:
+            totale = guess["totale"]
+
+    # Coerenza finale
+    if imponibile is not None and iva is not None:
+        calc = round(imponibile + iva, 2)
+        if totale is None or abs(totale - calc) > 0.05:
+            totale = calc
+
+    # 2.1) Se IVA mancante ma trovi una percentuale (es. 22%) e hai l'imponibile -> calcola IVA
+    if iva is None:
+        m_pct = RE_VAT_PERCENT.search(text)
+        if m_pct and imponibile is not None:
+            try:
+                pct = m_pct.group(1).replace(",", ".")
+                rate = float(pct) / 100.0
+                if 0.0 < rate < 1.0:
+                    iva = round(imponibile * rate, 2)
+            except Exception:
+                pass
+
+    # 2.2) Se TOTALE mancante ma hai imponibile e IVA -> calcola totale
+    if totale is None and (imponibile is not None and iva is not None):
+        totale = round(imponibile + iva, 2)
+
+    # 2.3) Se TOTALE presente ma discosta poco da (imponibile + IVA), riallinea
+    if (totale is not None and imponibile is not None and iva is not None):
+        calc = round(imponibile + iva, 2)
+        if abs(calc - totale) <= 0.05:
+            totale = calc
+
+    # 2.4) Se hai SOLO totale e una % IVA, ricostruisci imponibile/iva
+    if (imponibile is None or iva is None) and totale is not None:
+        m_pct = RE_VAT_PERCENT.search(text)
+        if m_pct:
+            try:
+                pct = m_pct.group(1).replace(",", ".")
+                rate = float(pct) / 100.0
+                if 0.0 < rate < 1.0:
+                    if imponibile is None and iva is None:
+                        base = round(totale / (1.0 + rate), 2)
+                        tax  = round(totale - base, 2)
+                        if abs((base + tax) - totale) <= 0.05:
+                            imponibile, iva = base, tax
+                    elif imponibile is None and iva is not None:
+                        base = round(totale - iva, 2)
+                        if abs(base * rate - iva) <= 0.05:
+                            imponibile = base
+                    elif iva is None and imponibile is not None:
+                        tax = round(imponibile * rate, 2)
+                        if abs((imponibile + tax) - totale) <= 0.05:
+                            iva = tax
+            except Exception:
+                pass
+
+    # Date
+    issue_date = _to_date(first_match(DATE_EMISSIONE, text))
+    if not issue_date:
+        any_date = first_match(DATE_ANY, text)
+        issue_date = _to_date(any_date)
+    due_date = _to_date(first_match(DATE_SCADENZA, text))
+
+    # Numero fattura
+    invoice_number = _invoice_number_from_lines(ll)
+    if not invoice_number:
+        m = RE_FATTURA_ONELINE.search(one_line)
+        if m:
+            cand = m.group(1).strip()
+            if cand and not DATE_LIKE.match(cand) and "." not in cand and CAND_INVOICE.match(cand):
+                invoice_number = cand
+    if not invoice_number:
+        invoice_number = first_match(INVOICE_NO_REGEX, text)
+
+    # Intestatario
+    idx_piva = next((i for i, l in enumerate(ll) if IVA_LABELED.search(l) or IVA_RAW.search(l)), None)
+    intestatario = _guess_intestatario(ll, idx_piva)
+
+    # P.IVA → canonicalizza
+    if piva:
+        raw = piva.replace("IT", "")
+        raw = re.sub(r"\D", "", raw)
+        if len(raw) < 11:
+            raw = raw.zfill(11)
+        piva = "IT" + raw
+
+    return {
+        "fields": {
+            "intestatario": intestatario,
+            "partita_iva": piva,
+            "codice_fiscale": cf,
+            "invoice_number": invoice_number,
+            "data_emissione": issue_date,
+            "data_scadenza": due_date,
+            "valuta": currency,
+            "imponibile": imponibile,
+            "iva": iva,
+            "totale": totale
+        },
+        "righe": []
+    }
+
+def parse_pdf_invoice(file_bytes: bytes) -> Dict[str, Any]:
+    text = _extract_text_auto(file_bytes)
+    return _parse_from_text(text)
+===== FILE: apps/backend/app/services/parsers/invoice_xml.py =====
+from typing import Dict, Any, List, Optional
+from lxml import etree
+
+def _txt(node: Optional[etree._Element]) -> Optional[str]:
+    return node.text.strip() if node is not None and node.text else None
+
+def _first(root, tag: str) -> Optional[etree._Element]:
+    if root is None:
+        return None
+    res = root.xpath(f".//*[local-name()='{tag}']")
+    return res[0] if res else None
+
+def _to_float_str(s: Optional[str]) -> Optional[float]:
+    """
+    Converte stringhe numeriche in float gestendo:
+    - Formato IT: 1.234,56  -> 1234.56
+    - Formato EN: 1,234.56  -> 1234.56
+    - Semplice:    1220.00  -> 1220.00
+    Regola:
+      - Se contiene SIA '.' che ',' -> assume '.' migliaia e ',' decimale (stile IT)
+      - Se contiene SOLO ','        -> ',' decimale (sostituita con '.')
+      - Se contiene SOLO '.'        -> '.' decimale (lascia)
+    """
+    if not s:
+        return None
+    s = s.strip()
+    if "." in s and "," in s:
+        # es: 1.234,56 -> 1234.56
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        # es: 1220,50 -> 1220.50
+        s = s.replace(",", ".")
+    else:
+        # es: 1220.00 -> 1220.00 (già ok)
+        pass
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def parse_xml_fatturapa(file_bytes: bytes) -> Dict[str, Any]:
+    parser = etree.XMLParser(recover=True, huge_tree=True)
+    xml = etree.fromstring(file_bytes, parser=parser)
+
+    # Cedente/Prestatore
+    cedente = _first(xml, "CedentePrestatore")
+    anagrafica = _first(cedente, "Anagrafica") if cedente is not None else None
+    denominazione = _first(anagrafica, "Denominazione") if anagrafica is not None else None
+    nome = _first(anagrafica, "Nome") if anagrafica is not None else None
+    cognome = _first(anagrafica, "Cognome") if anagrafica is not None else None
+
+    intestatario = _txt(denominazione) if denominazione is not None else None
+    if not intestatario:
+        intestatario = " ".join([p for p in [_txt(nome), _txt(cognome)] if p])
+
+    # P.IVA
+    id_fiscale = _first(cedente, "IdFiscaleIVA") if cedente is not None else None
+    id_paese = _first(id_fiscale, "IdPaese") if id_fiscale is not None else None
+    id_codice = _first(id_fiscale, "IdCodice") if id_fiscale is not None else None
+    paese = _txt(id_paese) or "IT"
+    codice = _txt(id_codice)
+    partita_iva = f"{paese}{codice}" if codice else None
+
+    # Codice Fiscale (se presente)
+    codice_fiscale = _txt(_first(cedente, "CodiceFiscale")) if cedente is not None else None
+
+    # Dati documento
+    dati_generali_doc = _first(xml, "DatiGeneraliDocumento")
+    invoice_number = _txt(_first(dati_generali_doc, "Numero")) if dati_generali_doc is not None else None
+    issue_date = _txt(_first(dati_generali_doc, "Data")) if dati_generali_doc is not None else None
+    currency = _txt(_first(dati_generali_doc, "Divisa")) if dati_generali_doc is not None else "EUR"
+    total = _to_float_str(_txt(_first(dati_generali_doc, "ImportoTotaleDocumento"))) if dati_generali_doc is not None else None
+    iva = _to_float_str(_txt(_first(dati_generali_doc, "TotaleImposta"))) if dati_generali_doc is not None else None
+    imponibile = _to_float_str(_txt(_first(dati_generali_doc, "TotaleImponibile"))) if dati_generali_doc is not None else None
+
+    # Scadenza (se presente)
+    dettaglio_pag = _first(xml, "DettaglioPagamento")
+    due_date = _txt(_first(dettaglio_pag, "DataScadenzaPagamento")) if dettaglio_pag is not None else None
+
+    # Linee
+    lines: List[Dict[str, Any]] = []
+    for det in xml.xpath("//*[local-name()='DettaglioLinee']"):
+        def _num(tag: str) -> float:
+            return _to_float_str(_txt(_first(det, tag))) or 0.0
+
+        lines.append({
+            "descrizione": _txt(_first(det, "Descrizione")),
+            "qta": _num("Quantita"),
+            "prezzo_unitario": _num("PrezzoUnitario"),
+            "aliquota_iva": _num("AliquotaIVA"),
+            "totale_riga": _num("PrezzoTotale"),
+        })
+
+    return {
+        "fields": {
+            "intestatario": intestatario,
+            "partita_iva": partita_iva,
+            "codice_fiscale": codice_fiscale,
+            "invoice_number": invoice_number,
+            "data_emissione": issue_date,
+            "data_scadenza": due_date,
+            "valuta": currency or "EUR",
+            "imponibile": imponibile,
+            "iva": iva,
+            "totale": total
+        },
+        "righe": lines
+    }
+===== FILE: apps/backend/app/services/parsers/__init__.py =====
+===== FILE: apps/backend/app/services/parsers/common.py =====
+import re
+from datetime import datetime
+from typing import Optional, List
+
+# --- Regex più robuste (IT) ---
+# P.IVA: etichettata o raw, 10-11 cifre (alcune P.IVA hanno uno zero iniziale omesso nei documenti)
+IVA_RAW = re.compile(r"\b(?:IT)?\s?(\d{10,11})\b")
+IVA_LABELED = re.compile(r"(?:P\.?\s*IVA|Partita\s*IVA)[^\d]{0,10}(\d{10,11})", re.IGNORECASE)
+
+# CF persona fisica: consenti spazi interni (es. "RSS MRA 90A01 A794T")
+CF_SPACED = re.compile(r"\b([A-Z]{3}\s*[A-Z]{3}\s*\d{2}\s*[A-Z]\s*\d{2}\s*[A-Z]\s*\d{3}\s*[A-Z])\b")
+
+# Valuta / importi
+CURRENCY_REGEX = re.compile(r"(EUR|€)", re.IGNORECASE)
+
+# Importi etichettati (accetta anche "TOTALE" su riga da solo)
+TOTAL_LABELED = re.compile(
+    r"(?:totale\s*(?:documento)?|^totale$)\s*[:€]?\s*([\d\.,]+)",
+    re.IGNORECASE | re.MULTILINE
+)
+NET_LABELED = re.compile(r"(?:imponibile|totale\s*imponibile)\s*[:€]?\s*([\d\.,]+)", re.IGNORECASE)
+
+# IVA come IMPORTO (non percentuale): cattura valori con decimali tipo "220,00"
+VAT_LABELED = re.compile(
+    r"(?:\biva\b[^\n\r]*?)"                           # “IVA …”
+    r"(\d{1,3}(?:[\.\,]\d{3})*(?:[\.,]\d{2}))",       # importo con decimali
+    re.IGNORECASE
+)
+
+# IVA in percentuale (es. "IVA 22%" oppure "Iva: 22 %")
+VAT_PERCENT = re.compile(
+    r"\biva\b[^\n\r%]*?(\d{1,2}(?:[.,]\d{1,2})?)\s*%",
+    re.IGNORECASE
+)
+
+# Date: supporta dd.mm.yy, dd.mm.yyyy, dd/mm/yy, yyyy-mm-dd
+DATE_ANY = re.compile(r"(\d{2}[./]\d{2}[./](\d{2}|\d{4})|\d{4}-\d{2}-\d{2})")
+DATE_EMISSIONE = re.compile(
+    r"(?:\bdata\b(?:\s*(?:emissione|fattura))?\s*:?\s*)"
+    r"(\d{2}[./]\d{2}[./](\d{2}|\d{4})|\d{4}-\d{2}-\d{2})",
+    re.IGNORECASE
+)
+DATE_SCADENZA = re.compile(
+    r"(?:\bscadenza\b|\bdata\s*scadenza\b)\s*:?\s*"
+    r"(\d{2}[./]\d{2}[./](\d{2}|\d{4})|\d{4}-\d{2}-\d{2})",
+    re.IGNORECASE
+)
+
+INVOICE_NO_REGEX = re.compile(r"(?:fattura|fatt\.|n[°o])\s*[:\-]?\s*([A-Za-z0-9/\\\-]+)", re.IGNORECASE)
+
+# Etichette che NON sono nomi (da saltare quando cerchiamo l'intestatario)
+LABEL_NO_NAME = {
+    "indirizzo", "citta'", "città", "partita iva", "cod. fisc", "codice fiscale", "p. iva", "p iva"
+}
+
+# Righe rumorose: CAP + città, indirizzo, solo numeri/segni
+CITY_LINE = re.compile(r"\b\d{5}\b\s*[-–]?\s*[A-Za-zÀ-ÖØ-öø-ÿ].*")  # es: 24100 - Bergamo (Bg)
+ADDRESS_LINE = re.compile(r"^(via|viale|piazza|corso|vicolo|largo)\b", re.IGNORECASE)
+ONLY_NUMERIC = re.compile(r"^[\d\.\,€\s]+$")
+
+def is_noise_name(line: str) -> bool:
+    low = line.lower()
+    if any(lbl in low for lbl in LABEL_NO_NAME):
+        return True
+    if CITY_LINE.search(line):
+        return True
+    if ADDRESS_LINE.search(line):
+        return True
+    if ONLY_NUMERIC.match(line):
+        return True
+    return False
+
+# --- Utils numeri/date ---
+
+def _to_float(s: Optional[str]) -> Optional[float]:
+    if not s:
+        return None
+    s = s.strip().replace("€", "")
+    if "." in s and "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+def _norm_year(y: int) -> int:
+    # per date tipo 02.01.17 → 2017 (assumi 00-79 → 2000+, 80-99 → 1900+)
+    return (2000 + y) if y <= 79 else (1900 + y)
+
+def _to_date(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    s = s.replace(".", "/")
+    # dd/mm/yy
+    m = re.match(r"^(\d{2})/(\d{2})/(\d{2})$", s)
+    if m:
+        d, mth, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            return datetime(_norm_year(y), mth, d).date().isoformat()
+        except ValueError:
+            return None
+    # dd/mm/yyyy
+    m = re.match(r"^(\d{2})/(\d{2})/(\d{4})$", s)
+    if m:
+        d, mth, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            return datetime(y, mth, d).date().isoformat()
+        except ValueError:
+            return None
+    # yyyy-mm-dd
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        return None
+
+# --- Helpers generici ---
+
+def first_match(regex, text: str) -> Optional[str]:
+    m = regex.search(text)
+    return m.group(1) if m else None
+
+def lines(text: str) -> List[str]:
+    return [l.strip() for l in text.splitlines() if l.strip()]
+
+def prev_nonempty(ll: List[str], idx: int, lookback: int = 3) -> Optional[str]:
+    for i in range(1, lookback+1):
+        j = idx - i
+        if j >= 0 and ll[j]:
+            return ll[j]
+    return None
+
+def normalize_cf(cf: Optional[str]) -> Optional[str]:
+    if not cf:
+        return None
+    return re.sub(r"\s+", "", cf).upper()
+===== FILE: apps/backend/app/services/repository_invoices.py =====
+import uuid
+from typing import List, Dict, Any, Optional
+from .db import execute
+
+def _to_float(x) -> float:
+    try:
+        if x is None: return 0.0
+        if isinstance(x, str):
+            x = x.replace(".", "").replace(",", ".").replace("%", "").strip()
+        return float(x)
+    except Exception:
+        return 0.0
+
+def _norm_aliquota(v: float) -> float:
+    # accetta 0..100; se > 1000 probabile valore *100 → riducilo
+    if v > 1000:
+        return round(v / 100.0, 3)
+    return round(v, 3)
+
+def insert_invoice_header(
+    *,
+    id: str,
+    s3_bucket: str,
+    s3_key: str,
+    filename: str,
+    invoice_number: Optional[str],
+    intestatario: Optional[str],
+    partita_iva: Optional[str],
+    codice_fiscale: Optional[str],
+    issue_date: Optional[str],
+    due_date: Optional[str],
+    currency: Optional[str],
+    imponibile: Optional[float],
+    iva: Optional[float],
+    totale: Optional[float],
+):
+    query = """
+    INSERT INTO invoices (
+      id, s3_bucket, s3_key, filename, invoice_number, intestatario, partita_iva,
+      codice_fiscale, issue_date, due_date, currency, imponibile, iva, totale
+    ) VALUES (
+      %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+    )
+    """
+    params = (
+        id, s3_bucket, s3_key, filename, invoice_number, intestatario, partita_iva,
+        codice_fiscale, issue_date, due_date, currency,
+        None if imponibile is None else round(_to_float(imponibile), 2),
+        None if iva is None else round(_to_float(iva), 2),
+        None if totale is None else round(_to_float(totale), 2),
+    )
+    execute(query, params)
+
+def insert_invoice_lines(*, invoice_id: str, lines: List[Dict[str, Any]]):
+    if not lines:
+        return
+    for idx, line in enumerate(lines, start=1):
+        line_id = str(uuid.uuid4())
+        descrizione = line.get("descrizione")
+        qta = _to_float(line.get("qta", 0))
+        prezzo_unitario = round(_to_float(line.get("prezzo_unitario", 0)), 2)
+        aliquota_iva = _norm_aliquota(_to_float(line.get("aliquota_iva", 0)))
+        totale_riga = round(_to_float(line.get("totale_riga", qta * prezzo_unitario * (1 + aliquota_iva/100.0))), 2)
+
+        query = """
+        INSERT INTO invoice_lines (
+          id, invoice_id, line_number, descrizione, qta, prezzo_unitario, aliquota_iva, totale_riga
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        params = (line_id, invoice_id, idx, descrizione, qta, prezzo_unitario, aliquota_iva, totale_riga)
+        execute(query, params)
+===== FILE: apps/backend/app/services/__init__.py =====
+===== FILE: apps/backend/app/services/invoice_service.py =====
+import os
+from typing import List, Tuple, Optional, Dict, Any
+from decimal import Decimal
+import boto3
+from botocore.client import Config
+from urllib.parse import urlparse, urlunparse
+
+from app.services.db import execute
+
+IS_TESTING = os.getenv("TESTING") == "1"
+
+
+def _to_float_db(x) -> Optional[float]:
+    if x is None:
+        return None
+    if isinstance(x, (int, float, Decimal)):
+        return float(x)
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def _row_to_api_item(r: Dict[str, Any]) -> Dict[str, Any]:
+    issue_date = r.get("issue_date")
+    due_date = r.get("due_date")
+
+    fields = {
+        "invoice_number": r.get("invoice_number"),
+        "intestatario": r.get("intestatario"),
+        "partita_iva": r.get("partita_iva"),
+        "codice_fiscale": r.get("codice_fiscale"),
+        "data_emissione": issue_date.isoformat() if issue_date else None,
+        "data_scadenza": due_date.isoformat() if due_date else None,
+        "valuta": r.get("currency") or "EUR",
+        "imponibile": _to_float_db(r.get("imponibile")),
+        "iva": _to_float_db(r.get("iva")),
+        "totale": _to_float_db(r.get("totale")),
+    }
+
+    return {
+        "id": str(r.get("id")),
+        "filename": r.get("filename"),
+        "s3": {"bucket": r.get("s3_bucket"), "key": r.get("s3_key")},
+        "fields": fields,
+    }
+
+
+def list_invoices(limit: int, offset: int) -> Tuple[List[Dict[str, Any]], int]:
+    if IS_TESTING:
+        return [], 0
+
+    sql_items = """
+        SELECT
+          id, filename, s3_bucket, s3_key,
+          invoice_number, intestatario, partita_iva, codice_fiscale,
+          issue_date, due_date, currency, imponibile, iva, totale
+        FROM invoices
+        ORDER BY created_at DESC
+        LIMIT %s OFFSET %s
+    """
+    rows = execute(sql_items, (limit, offset)) or []
+    items = [_row_to_api_item(r) for r in rows]
+
+    sql_count = "SELECT COUNT(*) AS total FROM invoices"
+    total_row = execute(sql_count) or [{"total": 0}]
+    total = int(total_row[0]["total"])
+    return items, total
+
+
+def get_invoice(invoice_id: str) -> Optional[Dict[str, Any]]:
+    if IS_TESTING:
+        return None
+
+    sql = """
+        SELECT
+          id, filename, s3_bucket, s3_key,
+          invoice_number, intestatario, partita_iva, codice_fiscale,
+          issue_date, due_date, currency, imponibile, iva, totale
+        FROM invoices
+        WHERE id = %s
+        LIMIT 1
+    """
+    rows = execute(sql, (invoice_id,)) or []
+    if not rows:
+        return None
+    return _row_to_api_item(rows[0])
+
+
+# ---------- MinIO / S3 presigned URL ----------
+
+def _s3_client():
+    endpoint = (
+        os.getenv("S3_ENDPOINT")
+        or os.getenv("MINIO_ENDPOINT")
+        or "http://minio:9000"
+    )
+    access_key = os.getenv("S3_ACCESS_KEY") or os.getenv("MINIO_ACCESS_KEY") or "minioadmin"
+    secret_key = os.getenv("S3_SECRET_KEY") or os.getenv("MINIO_SECRET_KEY") or "minioadmin"
+    region = os.getenv("S3_REGION") or "us-east-1"
+
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region,
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+
+
+def _externalize_presigned(url: str) -> str:
+    """
+    Se l'endpoint interno è 'http://minio:9000', riscrive host:porta
+    usando S3_PUBLIC_ENDPOINT (se presente) o 'http://localhost:9000'.
+    Questo rende l'URL apribile dal tuo Mac/browser.
+    """
+    public_base = os.getenv("S3_PUBLIC_ENDPOINT") or os.getenv("MINIO_PUBLIC_ENDPOINT") or "http://localhost:9000"
+    try:
+        u = urlparse(url)
+        p = urlparse(public_base)
+        # Mantieni schema/host/port pubblici, path e query del presigned
+        new = urlunparse((p.scheme, p.netloc, u.path, u.params, u.query, u.fragment))
+        return new
+    except Exception:
+        return url  # fallback: restituisci quello originale
+
+
+def get_presigned_url(bucket: str, key: str, expires_in: int = 900) -> Optional[str]:
+    if IS_TESTING:
+        base = os.getenv("S3_PUBLIC_ENDPOINT", "http://localhost:9000")
+        return f"{base.rstrip('/')}/{bucket}/{key}?exp={expires_in}"
+
+    s3 = _s3_client()
+    try:
+        url = s3.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=expires_in,
+        )
+        return _externalize_presigned(url)
+    except Exception:
+        return None
+===== FILE: apps/backend/app/services/storage.py =====
+import os
+from typing import Optional
+
+import boto3
+from botocore.client import Config
+from botocore.exceptions import ClientError
+
+S3_ENDPOINT = os.getenv("S3_ENDPOINT") or os.getenv("MINIO_ENDPOINT") or "http://minio:9000"
+S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY") or os.getenv("MINIO_ACCESS_KEY") or "minioadmin"
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY") or os.getenv("MINIO_SECRET_KEY") or "minioadmin"
+S3_BUCKET     = os.getenv("S3_BUCKET")     or os.getenv("MINIO_BUCKET")     or "ai-agent-dev"
+S3_REGION     = os.getenv("S3_REGION") or "us-east-1"
+
+def _s3_client():
+    use_ssl = S3_ENDPOINT.strip().lower().startswith("https://")
+    return boto3.client(
+        "s3",
+        endpoint_url=S3_ENDPOINT,
+        aws_access_key_id=S3_ACCESS_KEY,
+        aws_secret_access_key=S3_SECRET_KEY,
+        region_name=S3_REGION,
+        use_ssl=use_ssl,
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+
+def _ensure_bucket(s3, bucket: str):
+    try:
+        s3.head_bucket(Bucket=bucket)
+        return
+    except ClientError as e:
+        code = int(e.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0))
+        if code in (404, 301):
+            if S3_REGION == "us-east-1":
+                s3.create_bucket(Bucket=bucket)
+            else:
+                s3.create_bucket(
+                    Bucket=bucket,
+                    CreateBucketConfiguration={"LocationConstraint": S3_REGION},
+                )
+        else:
+            raise
+
+def upload_bytes(key: str, data: bytes, content_type: Optional[str] = None, bucket: Optional[str] = None):
+    s3 = _s3_client()
+    bucket = bucket or S3_BUCKET
+    try:
+        _ensure_bucket(s3, bucket)
+        extra = {"ContentType": content_type} if content_type else {}
+        s3.put_object(Bucket=bucket, Key=key, Body=data, **extra)
+        return {"bucket": bucket, "key": key}
+    except Exception as e:
+        raise RuntimeError(f"Errore upload su S3/MinIO ({S3_ENDPOINT}): {e}")
